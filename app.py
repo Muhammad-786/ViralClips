@@ -1,29 +1,59 @@
-import streamlit as st
+import os
+import io
+import cv2
+import shutil
 import tempfile
+import asyncio
 import subprocess
 import aiohttp
-import asyncio
-import os
+import streamlit as st
+
 from transformers import pipeline
 import whisper
-import cv2
-import io
 
-# Initialize AI models
-st.title("Viral Clip Extractor")
-st.write("Upload a video or provide a OneDrive link, and AI will find the best moments!")
+# -------------------------------------------
+# 1. Check for FFmpeg and FFprobe dependencies
+# -------------------------------------------
+import shutil
 
-emotion_model = pipeline("sentiment-analysis")
-whisper_model = whisper.load_model("base")
+ffmpeg_path = shutil.which("ffmpeg")
+ffprobe_path = shutil.which("ffprobe")
+
+if ffmpeg_path is None or ffprobe_path is None:
+    st.error("FFmpeg/FFprobe is not installed or not found in PATH. Please install or configure them properly.")
+    st.stop()
+
+# -------------------------------------------
+# 2. Caching the models
+# -------------------------------------------
+@st.cache_resource
+def load_models():
+    """
+    Cache the loading of Whisper and emotion model to avoid re-loading on every rerun.
+    """
+    # Optional: More detailed emotions model
+    emotion_model = pipeline("text-classification", 
+                             model="bhadresh-savani/distilbert-base-uncased-emotion", 
+                             return_all_scores=True)
+    
+    # Or revert to simple sentiment: pipeline("sentiment-analysis")
+    whisper_model = whisper.load_model("base")
+    return emotion_model, whisper_model
+
+emotion_model, whisper_model = load_models()
+
+# -------------------------------------------
+# 3. Helper Functions
+# -------------------------------------------
 
 def check_video_metadata(file_path):
     """
     Check video metadata using FFprobe with detailed error reporting.
-    Returns (is_valid, error_message)
+    Returns (is_valid, error_message).
     """
     try:
         probe_command = [
-            'ffprobe',
+            ffprobe_path,
             '-v', 'quiet',
             '-print_format', 'json',
             '-show_format',
@@ -49,14 +79,15 @@ def check_video_metadata(file_path):
     except Exception as e:
         return False, f"Error analyzing video file: {str(e)}"
 
+
 def repair_video_file(input_path, output_path):
     """
     Attempt to repair video file by re-encoding it.
-    Returns (success, error_message)
+    Returns (success, error_message).
     """
     try:
         repair_command = [
-            'ffmpeg',
+            ffmpeg_path,
             '-i', input_path,
             '-c:v', 'copy',
             '-c:a', 'copy',
@@ -79,21 +110,21 @@ def repair_video_file(input_path, output_path):
     except Exception as e:
         return False, f"Error during repair attempt: {str(e)}"
 
+
 def process_uploaded_file(uploaded_file):
     """
     Process and validate uploaded file with repair attempts if needed.
-    Returns (valid_path, error_message)
+    Returns (valid_path, error_message).
+    
+    Uses chunk-based copying to avoid reading entire file into memory at once.
     """
     if not uploaded_file:
         return None, "No file uploaded."
         
     try:
-        # Read file content into memory
-        file_content = uploaded_file.read()
-        
-        # Create temporary file for initial save
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
-            temp_file.write(file_content)
+            # More memory-efficient: copy in chunks
+            shutil.copyfileobj(uploaded_file, temp_file)
             temp_path = temp_file.name
         
         # Check initial file
@@ -103,7 +134,6 @@ def process_uploaded_file(uploaded_file):
             
         # Attempt repair if initial validation fails
         st.warning("Initial video validation failed. Attempting to repair file...")
-        
         repair_output = temp_path + "_repaired.mp4"
         repair_success, repair_error = repair_video_file(temp_path, repair_output)
         
@@ -142,17 +172,21 @@ def process_uploaded_file(uploaded_file):
     except Exception as e:
         return None, f"Error processing upload: {str(e)}"
 
+
 def extract_audio(video_path, output_path):
-    """Extract audio from video using FFmpeg with proper error handling."""
+    """
+    Extract audio from video using FFmpeg with proper error handling.
+    Returns True if successful, False otherwise.
+    """
     command = [
-        'ffmpeg',
+        ffmpeg_path,
         '-i', video_path,
         '-vn',  # Disable video
         '-acodec', 'libmp3lame',
         '-ar', '44100',  # Set audio sample rate
-        '-ac', '2',  # Set number of audio channels
-        '-ab', '192k',  # Set audio bitrate
-        '-y',  # Overwrite output file if exists
+        '-ac', '2',      # Set number of audio channels
+        '-ab', '192k',   # Set audio bitrate
+        '-y',            # Overwrite output file if exists
         output_path
     ]
     
@@ -168,8 +202,12 @@ def extract_audio(video_path, output_path):
         st.error(f"FFmpeg error: {e.stderr}")
         return False
 
+
 def extract_audio_emotion(video_path):
-    """Extract audio and analyze emotions from the video."""
+    """
+    Extract audio and analyze emotions from the video.
+    Returns (transcript_text, emotion_results).
+    """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
         
@@ -178,22 +216,23 @@ def extract_audio_emotion(video_path):
     try:
         # Extract audio
         if not extract_audio(video_path, audio_path):
-            raise Exception("Failed to extract audio from video")
+            raise Exception("Failed to extract audio from video.")
         
         if not os.path.exists(audio_path):
-            raise FileNotFoundError("Audio extraction failed - no output file created")
+            raise FileNotFoundError("Audio extraction failed - no output file created.")
         
         # Transcribe audio using Whisper
         transcription = whisper_model.transcribe(audio_path)
         if not transcription or "text" not in transcription:
-            raise ValueError("Transcription failed - no text output generated")
+            raise ValueError("Transcription failed - no text output generated.")
             
         transcript_text = transcription["text"]
         
-        # Analyze transcription for sentiment
+        # Analyze transcription for sentiment/emotion
         if not transcript_text.strip():
-            raise ValueError("Empty transcription")
+            raise ValueError("Empty transcription.")
             
+        # For the more detailed emotion model, returns a list of scores for each label
         emotion_results = emotion_model(transcript_text)
         
         return transcript_text, emotion_results
@@ -209,23 +248,27 @@ def extract_audio_emotion(video_path):
         except Exception as e:
             st.warning(f"Failed to clean up audio file: {str(e)}")
 
+
 def extract_highlight_frames(video_path, n_highlights=3):
-    """Extract highlight frames from the video."""
+    """
+    Extract highlight frames from the video at evenly spaced intervals.
+    Returns a list of file paths to the saved highlight frames.
+    """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
         
     vidcap = cv2.VideoCapture(video_path)
     if not vidcap.isOpened():
-        raise Exception("Failed to open video file")
+        raise Exception("Failed to open video file.")
         
     try:
         fps = vidcap.get(cv2.CAP_PROP_FPS)
         if fps <= 0:
-            raise ValueError("Invalid FPS value detected")
+            raise ValueError("Invalid FPS value detected.")
             
         frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
         if frame_count <= 0:
-            raise ValueError("Invalid frame count detected")
+            raise ValueError("Invalid frame count detected.")
             
         duration = frame_count / fps
 
@@ -240,7 +283,7 @@ def extract_highlight_frames(video_path, n_highlights=3):
             success, image = vidcap.read()
             
             if not success or image is None:
-                st.warning(f"Failed to extract frame {i}")
+                st.warning(f"Failed to extract frame {i}.")
                 continue
                 
             try:
@@ -255,6 +298,13 @@ def extract_highlight_frames(video_path, n_highlights=3):
         
     finally:
         vidcap.release()
+
+# -------------------------------------------
+# 4. Streamlit App Layout and Flow
+# -------------------------------------------
+
+st.title("Viral Clip Extractor")
+st.write("Upload a video or provide a OneDrive link, and AI will find the best moments!")
 
 # Input method selection
 input_type = st.radio("Choose input type:", ("Upload File", "OneDrive Link"))
@@ -280,9 +330,9 @@ elif input_type == "OneDrive Link":
     if video_url and st.button("Download Video"):
         st.write("Downloading video...")
         try:
-            async def download_video(video_url):
+            async def download_video(url):
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(video_url) as response:
+                    async with session.get(url) as response:
                         if response.status == 200:
                             data = await response.read()
                             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
@@ -292,7 +342,11 @@ elif input_type == "OneDrive Link":
                             raise Exception(f"Download failed with status: {response.status}")
 
             temp_path = asyncio.run(download_video(video_url))
-            video_path, error_msg = process_uploaded_file(io.BytesIO(open(temp_path, 'rb').read()))
+            
+            # Re-open the file for processing
+            with open(temp_path, 'rb') as f:
+                video_path, error_msg = process_uploaded_file(f)
+            
             if error_msg:
                 st.error(error_msg)
                 video_path = None
@@ -303,11 +357,13 @@ elif input_type == "OneDrive Link":
             st.error(f"Failed to download video: {e}")
             video_path = None
 
-# Process the video if available
+# -------------------------------------------
+# 5. Processing the video if available
+# -------------------------------------------
 if video_path and os.path.exists(video_path):
     st.write("Video uploaded successfully. Processing...")
 
-    # User options for customization
+    # User option for number of highlights
     n_highlights = st.slider("Number of highlights to extract:", min_value=1, max_value=10, value=3)
 
     # Processing steps with feedback
@@ -323,23 +379,27 @@ if video_path and os.path.exists(video_path):
             highlights = []
             frame_results = extract_highlight_frames(video_path, n_highlights=n_highlights)
             
+            # Update progress
             for i, frame_path in enumerate(frame_results):
                 highlights.append(frame_path)
-                progress_bar.progress((i + 1) / n_highlights * 100)
+                progress_bar.progress(int((i + 1) / n_highlights * 100))
 
             # Display results
             if transcript:
-                st.write("**Transcript:**", transcript)
+                st.subheader("Transcript:")
+                st.write(transcript)
+            
             if emotion_results:
-                st.write("**Emotion Analysis:**", emotion_results)
+                st.subheader("Emotion Analysis:")
+                st.write(emotion_results)
 
             if highlights:
-                st.write("**Highlights:**")
+                st.subheader("Highlights:")
                 for i, highlight in enumerate(highlights):
                     if os.path.exists(highlight):
                         st.image(highlight, caption=f"Highlight {i+1}")
                     else:
-                        st.warning(f"Highlight {i+1} image not found")
+                        st.warning(f"Highlight {i+1} image not found.")
 
             st.success("Processing complete!")
 
